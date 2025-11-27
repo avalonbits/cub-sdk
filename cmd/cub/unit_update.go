@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -361,94 +362,154 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 
 	newParams := &goclientnew.UpdateUnitParams{}
 
-	// Prepare Unit metadata
-
-	var patchData []byte
+	var unitDetails *goclientnew.Unit
 	if isPatch {
-		// Create enhancer for unit-specific fields
-		var enhancer PatchEnhancer = func(patchMap map[string]interface{}) {
-			// Handle destroy gates for units
-			err := setDestroyGatesInPatch(patchMap)
-			if err != nil {
-				failOnError(err)
-			}
-			if changeDescription != "" {
-				patchMap["LastChangeDescription"] = changeDescription
-			}
-			if changesetSlug != "" {
-				if changesetSlug == "-" {
-					// Special value to remove the changeset
-					patchMap["ChangeSetID"] = nil
-				} else {
-					changesetUUID, err := parseChangeSetSlug(changesetSlug)
-					if err != nil {
-						failOnError(fmt.Errorf("failed to get changeset: %w", err))
-						return
-					}
-					patchMap["ChangeSetID"] = changesetUUID
-					newParams.ChangeSetId = &changesetUUID
-				}
-			}
-		}
-		// Build patch data using consolidated function. It reads from stdin/file and sets labels, if any.
-		patchData, err = BuildPatchData(enhancer)
-		if err != nil {
+		if unitDetails, err = cmdPatchUnit(spaceID, args, currentUnit, newParams); err != nil {
 			return err
 		}
 	} else {
-		// Handle --from-stdin or --filename with optional --replace
-		if flagPopulateModelFromStdin || flagFilename != "" {
-			existingUnit := currentUnit
-			if flagReplace {
-				// Replace mode - create new entity, allow Version to be overwritten
-				currentUnit = new(goclientnew.Unit)
-				currentUnit.Version = existingUnit.Version
+		mergedUnit, err := cmdUpdateUnitStdin(args, currentUnit, newParams)
+		if err != nil {
+			return err
+		}
+
+		for {
+			unitDetails, err = updateUnit(spaceID, mergedUnit, newParams)
+			if err == nil {
+				break
 			}
 
-			if err := populateModelFromFlags(currentUnit); err != nil {
+			if !errors.Is(err, errConflict) {
 				return err
 			}
 
-			// Ensure essential fields can't be clobbered
-			currentUnit.OrganizationID = existingUnit.OrganizationID
-			currentUnit.SpaceID = existingUnit.SpaceID
-			currentUnit.UnitID = existingUnit.UnitID
-
-		}
-		// For non-patch operations, handle labels in the traditional way
-		err = setLabels(&currentUnit.Labels)
-		if err != nil {
-			return err
-		}
-		err = setDeleteGates(&currentUnit.DeleteGates)
-		if err != nil {
-			return err
-		}
-		err = setDestroyGatesField(&currentUnit.DestroyGates)
-		if err != nil {
-			return err
-		}
-		// For non-patch operations, handle change description in the traditional way
-		if changeDescription != "" {
-			currentUnit.LastChangeDescription = changeDescription
-		}
-		// For non-patch operations, handle changeset in the traditional way
-		if changesetSlug != "" {
-			if changesetSlug == "-" {
-				// Special value to remove the changeset (only valid in patch mode)
-				return errors.New("use --patch mode to remove a changeset (--changeset -)")
-			}
-			changesetUUID, err := parseChangeSetSlug(changesetSlug)
+			// Check if fields are conflicting. If not, try again.
+			newUnit, err := apiGetUnitFromSlug(args[0], "*") // get all fields for RMW
 			if err != nil {
 				return err
 			}
-			currentUnit.ChangeSetID = &changesetUUID
-			newParams.ChangeSetId = &changesetUUID
+
+			// Because this checks for every single field, we set the version to be the new one so that if that
+			// is the only field conflicting, we can retry it.
+			mergedUnit.Version = newUnit.Version
+			if err := checkConflictingFields(newUnit, mergedUnit); err != nil {
+				return err
+			}
+
+			// Fields are non-conflicting. Loop back to try to update the unit again.
 		}
 	}
 
-	// Prepare Unit Data. These alternatives are ensured to be mutually exclusive by checkConflictingArgs above.
+	// Wait for trigger+resolve completion
+	if wait {
+		err = awaitTriggersRemoval(unitDetails)
+		if err != nil {
+			return err
+		}
+	}
 
+	// Display results
+	displayUpdateResults(unitDetails, "unit", args[0], unitDetails.UnitID.String(), displayUnitDetails)
+	return nil
+}
+
+func cmdPatchUnit(spaceID uuid.UUID, args []string, currentUnit *goclientnew.Unit, newParams *goclientnew.UpdateUnitParams) (*goclientnew.Unit, error) {
+	// Create enhancer for unit-specific fields
+	var enhancer PatchEnhancer = func(patchMap map[string]any) {
+		// Handle destroy gates for units
+		err := setDestroyGatesInPatch(patchMap)
+		if err != nil {
+			failOnError(err)
+		}
+		if changeDescription != "" {
+			patchMap["LastChangeDescription"] = changeDescription
+		}
+		if changesetSlug != "" {
+			if changesetSlug == "-" {
+				// Special value to remove the changeset
+				patchMap["ChangeSetID"] = nil
+			} else {
+				changesetUUID, err := parseChangeSetSlug(changesetSlug)
+				if err != nil {
+					failOnError(fmt.Errorf("failed to get changeset: %w", err))
+					return
+				}
+				patchMap["ChangeSetID"] = changesetUUID
+				newParams.ChangeSetId = &changesetUUID
+			}
+		}
+	}
+	// Build patch data using consolidated function. It reads from stdin/file and sets labels, if any.
+	patchData, err := BuildPatchData(enhancer)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := prepareUnitData(args, currentUnit, newParams); err != nil {
+		return nil, err
+	}
+
+	return patchUnit(spaceID, currentUnit.UnitID, newParams, patchData)
+}
+
+func cmdUpdateUnitStdin(args []string, currentUnit *goclientnew.Unit, newParams *goclientnew.UpdateUnitParams) (*goclientnew.Unit, error) {
+	// Handle --from-stdin or --filename with optional --replace
+	if flagPopulateModelFromStdin || flagFilename != "" {
+		existingUnit := currentUnit
+		if flagReplace {
+			// Replace mode - create new entity, allow Version to be overwritten
+			currentUnit = new(goclientnew.Unit)
+			currentUnit.Version = existingUnit.Version
+		}
+
+		if err := populateModelFromFlags(currentUnit); err != nil {
+			return nil, err
+		}
+
+		// Ensure essential fields can't be clobbered
+		currentUnit.OrganizationID = existingUnit.OrganizationID
+		currentUnit.SpaceID = existingUnit.SpaceID
+		currentUnit.UnitID = existingUnit.UnitID
+
+	}
+	// For non-patch operations, handle labels in the traditional way
+	if err := setLabels(&currentUnit.Labels); err != nil {
+		return nil, err
+	}
+	if err := setDeleteGates(&currentUnit.DeleteGates); err != nil {
+		return nil, err
+	}
+	if err := setDestroyGatesField(&currentUnit.DestroyGates); err != nil {
+		return nil, err
+	}
+
+	// For non-patch operations, handle change description in the traditional way
+	if changeDescription != "" {
+		currentUnit.LastChangeDescription = changeDescription
+	}
+	// For non-patch operations, handle changeset in the traditional way
+	if changesetSlug != "" {
+		if changesetSlug == "-" {
+			// Special value to remove the changeset (only valid in patch mode)
+			return nil, errors.New("use --patch mode to remove a changeset (--changeset -)")
+		}
+		changesetUUID, err := parseChangeSetSlug(changesetSlug)
+		if err != nil {
+			return nil, err
+		}
+		currentUnit.ChangeSetID = &changesetUUID
+		newParams.ChangeSetId = &changesetUUID
+	}
+
+	if err := prepareUnitData(args, currentUnit, newParams); err != nil {
+		return nil, err
+	}
+
+	return currentUnit, nil
+}
+
+func prepareUnitData(args []string, currentUnit *goclientnew.Unit, newParams *goclientnew.UpdateUnitParams) error {
+	// Prepare Unit Data. These alternatives are ensured to be mutually exclusive by checkConflictingArgs above.
 	if dryRun {
 		newParams.DryRun = &dryRun
 	}
@@ -483,7 +544,7 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 			mergeSourceUnit = currentUnit
 		} else {
 			// Parse merge source unit
-			mergeSourceUnit, err = parseEntityIdentifierSingleAsEntity[goclientnew.Unit](
+			mergeSourceUnit, err := parseEntityIdentifierSingleAsEntity(
 				mergeSource,
 				"unit",
 				"UnitID,SpaceID,HeadRevisionNum",
@@ -540,31 +601,72 @@ func unitUpdateCmdRun(cmd *cobra.Command, args []string) error {
 		failOnError(err)
 		newParams.Tag = &tagID
 	}
+	return nil
+}
 
-	// Perform the update
-
-	var unitDetails *goclientnew.Unit
-	if isPatch {
-		unitDetails, err = patchUnit(spaceID, currentUnit.UnitID, newParams, patchData)
-	} else {
-		unitDetails, err = updateUnit(spaceID, currentUnit, newParams)
-	}
-	if err != nil {
-		return err
+// checkConflictingFields checks if two struts have conflicting fields.
+func checkConflictingFields(newValue, currentValue any) error {
+	newV := reflect.ValueOf(newValue)
+	if newV.Kind() == reflect.Ptr {
+		newV = newV.Elem()
 	}
 
-	// Wait for trigger+resolve completion
+	currV := reflect.ValueOf(currentValue)
+	if currV.Kind() == reflect.Ptr {
+		currV = currV.Elem()
+	}
 
-	if wait {
-		err = awaitTriggersRemoval(unitDetails)
-		if err != nil {
-			return err
+	if newV.Type() != currV.Type() {
+		return fmt.Errorf("values have different types: %v != %v", newV.Type(), currV.Type())
+	}
+
+	// If this is not structs that we are comparing, then we can't really check fields. We just return
+	// an error if they are not deep equal
+	if newV.Kind() != reflect.Struct {
+		if !reflect.DeepEqual(newValue, currentValue) {
+			return fmt.Errorf("%v != %v", newValue, currentValue)
 		}
+		return nil
 	}
 
-	// Display results
+	// They are of the same type so they should have the same number and order of fields.
+	conflictingFields := []string{}
+	fieldCount := newV.NumField()
+	for i := range fieldCount {
+		newVField := newV.Field(i)
+		currVField := currV.Field(i)
+		if reflect.DeepEqual(newVField.Interface(), currVField.Interface()) {
+			continue
+		}
 
-	displayUpdateResults(unitDetails, "unit", args[0], unitDetails.UnitID.String(), displayUnitDetails)
+		// Fields are different. First we check if they are maps.
+		// We consider them non conflicting if the user provided unit only adds new entries i.e no enrty
+		// deletion nor entry value change.
+		if newVField.Kind() == reflect.Map {
+			iter := newVField.MapRange()
+			conflict := false
+			for iter.Next() {
+				newK, newV := iter.Key(), iter.Value()
+				currV := currVField.MapIndex(newK)
+				if !reflect.DeepEqual(newV.Interface(), currV.Interface()) {
+					conflict = true
+					break
+				}
+			}
+			if !conflict {
+				continue
+			}
+		}
+
+		conflictingFields = append(
+			conflictingFields,
+			fmt.Sprintf("- field %q conflicts: %v != %v", newV.Type().Field(i).Name, newVField, currVField.Interface()),
+		)
+	}
+
+	if len(conflictingFields) > 0 {
+		return errors.New("\n" + strings.Join(conflictingFields, "\n"))
+	}
 	return nil
 }
 
@@ -760,10 +862,17 @@ func runBulkUnitUpdate() error {
 	return handleBulkCreateOrUpdateResponse(responses, statusCode, "update", "")
 }
 
+var errConflict = fmt.Errorf("conflict")
+
 func updateUnit(spaceID uuid.UUID, currentUnit *goclientnew.Unit, params *goclientnew.UpdateUnitParams) (*goclientnew.Unit, error) {
 	updatedRes, err := cubClientNew.UpdateUnitWithResponse(ctx, spaceID, currentUnit.UnitID, params, *currentUnit)
 	if cubapi.IsAPIError(err, updatedRes) {
-		return nil, cubapi.InterpretErrorGeneric(err, updatedRes)
+		err = cubapi.InterpretErrorGeneric(err, updatedRes)
+		if updatedRes.StatusCode() == 409 {
+			return nil, fmt.Errorf("(%w): %w", errConflict, err)
+		} else {
+			return nil, err
+		}
 	}
 
 	return updatedRes.JSON200, nil

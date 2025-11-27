@@ -190,9 +190,32 @@ func runSingleSpaceUpdate(args []string) error {
 		newBody.WhereTrigger = spaceUpdateArgs.whereTrigger
 	}
 
-	spaceRes, err := cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *newBody)
-	if cubapi.IsAPIError(err, spaceRes) {
-		return cubapi.InterpretErrorGeneric(err, spaceRes)
+	var spaceRes *goclientnew.UpdateSpaceResponse
+	for {
+		spaceRes, err = cubClientNew.UpdateSpaceWithResponse(ctx, currentSpaceID, *newBody)
+		if err == nil || !cubapi.IsAPIError(err, spaceRes) {
+			break
+		}
+
+		// If this is not a conflict, then return the error.
+		if spaceRes.StatusCode() != 409 {
+			return cubapi.InterpretErrorGeneric(err, spaceRes)
+		}
+
+		// We have a conflict. Check if the fields are conflicting and if not, retry.
+		newSpace, err := apiGetSpaceFromSlug(args[0], "*") // get all fields for RMW
+		if err != nil {
+			return err
+		}
+
+		// Because this checks for every single field, we set the version to be the new one so that if that
+		// is the only field conflicting, we can retry it.
+		newBody.Version = newSpace.Version
+		if err := checkConflictingFields(newSpace, newBody); err != nil {
+			return err
+		}
+
+		// Fields don't conflict. Loop back and try again
 	}
 
 	spaceDetails := spaceRes.JSON200
